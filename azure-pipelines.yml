@@ -1,36 +1,76 @@
-trigger: none   # we only trigger on image push
+# Auto-deploy to AKS when a new image is pushed to ACR
+# ----------------------------------------------------
+# Prereqs:
+# - Service connection: <ARM_SERVICE_CONNECTION> (Azure Resource Manager) with access to ACR RG and AKS RG
+# - AKS has ACR pull rights:
+#     az aks update -g rg-sw-web-dev-cac-01 -n aks-web-dev-cac-01 --attach-acr crwebdevcac01
+# - A Deployment exists: name=webapp, container=web (apply once via kubectl/Helm)
+
+trigger: none   # only trigger on ACR image pushes
 
 resources:
   containers:
     - container: app
       type: ACR
-      azureSubscription: "ARM_SERVICE_CONNECTION"
+      azureSubscription: 'ARM_SERVICE_CONNECTION'   # <-- replace with your ARM service connection name
       resourceGroup: rg-sw-web-dev-cac-01
       registry: crwebdevcac01
-      repository: webapp
+      repository: virecintelligencevirecwebapp
       trigger:
         enabled: true
         tags:
           include:
-            - '*'       # or narrow to 'v*', 'prod-*', etc.
+            - '*'   # or narrow to 'v*', 'prod-*', etc.
 
 variables:
+  # AKS target
   AKS_RG: rg-sw-web-dev-cac-01
   AKS_NAME: aks-web-dev-cac-01
-  NAMESPACE: web
+  NAMESPACE: default
+
+  # K8s objects
+  DEPLOYMENT_NAME: webapp
+  CONTAINER_NAME: web
+
+  # Image
+  ACR_LOGIN_SERVER: crwebdevcac01.azurecr.io
+  IMAGE_REPOSITORY: virecintelligencevirecwebapp
 
 stages:
 - stage: Deploy
+  displayName: Deploy image $(resources.containers.app.tag) to AKS
   jobs:
-  - job: kubectl_set_image
+  - job: rollout
+    displayName: Update Deployment and wait for rollout
     pool: { vmImage: 'ubuntu-latest' }
     steps:
     - task: AzureCLI@2
+      displayName: Set image and rollout
       inputs:
-        azureSubscription: "ARM_SERVICE_CONNECTION"
+        azureSubscription: 'ARM_SERVICE_CONNECTION'   # <-- same service connection as above
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
-          az aks get-credentials -g $(AKS_RG) -n $(AKS_NAME) --overwrite-existing
-          kubectl -n $(NAMESPACE) set image deploy/webapp web=crwebdevcac01.azurecr.io/webapp:$(resources.containers.app.tag)
-          kubectl -n $(NAMESPACE) rollout status deploy/webapp
+          set -euo pipefail
+
+          echo "==> Get AKS credentials"
+          az aks get-credentials -g "$(AKS_RG)" -n "$(AKS_NAME)" --overwrite-existing
+
+          # Using default namespace; create only if you change NAMESPACE
+          if [ "$(NAMESPACE)" != "default" ]; then
+            echo "==> Ensure namespace '$(NAMESPACE)' exists"
+            kubectl create namespace "$(NAMESPACE)" --dry-run=client -o yaml | kubectl apply -f -
+          fi
+
+          IMAGE_TAG="$(resources.containers.app.tag)"
+          FULL_IMAGE="$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):${IMAGE_TAG}"
+
+          echo "==> Patching deployment '$(DEPLOYMENT_NAME)' container '$(CONTAINER_NAME)' with image: ${FULL_IMAGE}"
+          kubectl -n "$(NAMESPACE)" set image "deployment/$(DEPLOYMENT_NAME)" "$(CONTAINER_NAME)=${FULL_IMAGE}"
+
+          echo "==> Waiting for rollout"
+          kubectl -n "$(NAMESPACE)" rollout status "deployment/$(DEPLOYMENT_NAME)"
+
+          echo "==> Current image:"
+          kubectl -n "$(NAMESPACE)" get deploy "$(DEPLOYMENT_NAME)" \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="'$(CONTAINER_NAME)'")].image}'; echo

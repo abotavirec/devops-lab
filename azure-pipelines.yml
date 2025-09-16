@@ -1,0 +1,36 @@
+trigger: none   # we only trigger on image push
+
+resources:
+  containers:
+    - container: app
+      type: ACR
+      azureSubscription: "ARM_SERVICE_CONNECTION"
+      resourceGroup: rg-sw-web-dev-cac-01
+      registry: crwebdevcac01
+      repository: webapp
+      trigger:
+        enabled: true
+        tags:
+          include:
+            - '*'       # or narrow to 'v*', 'prod-*', etc.
+
+variables:
+  AKS_RG: rg-sw-web-dev-cac-01
+  AKS_NAME: aks-web-dev-cac-01
+  NAMESPACE: web
+
+stages:
+- stage: Deploy
+  jobs:
+  - job: kubectl_set_image
+    pool: { vmImage: 'ubuntu-latest' }
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: "ARM_SERVICE_CONNECTION"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az aks get-credentials -g $(AKS_RG) -n $(AKS_NAME) --overwrite-existing
+          kubectl -n $(NAMESPACE) set image deploy/webapp web=crwebdevcac01.azurecr.io/webapp:$(resources.containers.app.tag)
+          kubectl -n $(NAMESPACE) rollout status deploy/webapp

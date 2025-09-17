@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: virec-web-app
+  namespace: default
+  labels:
+    app: virec-web-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: virec-web-app
+  template:
+    metadata:
+      labels:
+        app: virec-web-app
+    spec:
+      containers:
+        - name: main
+          image: crwebdevcac01.azurecr.io/virecintelligencevirecwebapp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          env:
+            - name: ASPNETCORE_URLS
+              value: http://+:80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: virec-web-app-svc
+  namespace: default
+spec:
+  selector:
+    app: virec-web-app
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP

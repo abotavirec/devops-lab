@@ -1,11 +1,16 @@
 
-# ---------- CI Trigger ----------
+# ---------- CI & PR Triggers ----------
 trigger:
   branches:
     include:
-      - main  # Change to your desired branch
+      - main
 
-# ---------- Runtime parameters ----------
+pr:
+  branches:
+    include:
+      - main
+
+# ---------- Runtime Parameters ----------
 parameters:
   - name: imageRepository
     displayName: Image repository (in ACR)
@@ -27,7 +32,7 @@ parameters:
     type: string
     default: k8s/deployment.yaml
 
-# ---------- Static variables ----------
+# ---------- Static Variables ----------
 variables:
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
   K8S_NAMESPACE: 'default'
@@ -49,7 +54,7 @@ stages:
           # Optional manifest apply
           - task: KubernetesManifest@1
             displayName: 'Apply Kubernetes manifest (if enabled)'
-            condition: and(succeeded(), eq('${{ parameters.applyManifest }}', 'true'))
+            condition: and(succeeded(), eq(${{ parameters.applyManifest }}, true))
             inputs:
               action: 'deploy'
               kubernetesServiceConnection: '$(SC_AKS)'

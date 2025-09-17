@@ -1,83 +1,107 @@
-trigger: none
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - '**/*'
 
-resources:
-  containers:
-    - container: app
-      type: ACR
-      azureSubscription: 'ARM_SERVICE_CONNECTION'
-      resourceGroup: rg-sw-web-dev-cac-01
-      registry: crwebdevcac01
-      repository: virecintelligencevirecwebapp
-      trigger:
-        enabled: true
-        tags: { include: [ '*' ] }
-
-# Optional: allow a manual tag when you run the pipeline manually
-parameters:
-- name: manualTag
-  displayName: "Tag to deploy (manual runs)"
-  type: string
-  default: ""
-
+# Variables you might tweak
 variables:
-  AKS_RG: rg-sw-web-dev-cac-01
-  AKS_NAME: aks-web-dev-cac-01
-  NAMESPACE: default
-  DEPLOYMENT_NAME: webapp
-  CONTAINER_NAME: web
-  ACR_LOGIN_SERVER: crwebdevcac01.azurecr.io
-  IMAGE_REPOSITORY: virecintelligencevirecwebapp
+  ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
+  IMAGE_REPOSITORY: 'virecintelligencevirecwebapp'
+  CONTAINER_NAME: 'main'
+  K8S_NAMESPACE: 'default'
+  K8S_DEPLOYMENT: 'virec-web-app'
 
 stages:
-- stage: Deploy
-  displayName: Deploy image to AKS
-  jobs:
-  - job: rollout
-    displayName: Update Deployment and wait for rollout
-    pool: { vmImage: 'ubuntu-latest' }
-    steps:
-    - task: AzureCLI@2
-      displayName: Set image and rollout
-      inputs:
-        azureSubscription: 'ARM_SERVICE_CONNECTION'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
+  - stage: Build_Push
+    displayName: Build & Push image to ACR
+    jobs:
+      - job: Build
+        displayName: Docker build & push
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: Docker@2
+            displayName: 'Login to ACR'
+            inputs:
+              command: login
+              containerRegistry: 'sc-acr-crwebdevcac01'
 
-          echo "==> Get AKS credentials"
-          az aks get-credentials -g "$(AKS_RG)" -n "$(AKS_NAME)" --overwrite-existing
+          - task: Docker@2
+            displayName: 'Build image'
+            inputs:
+              command: build
+              repository: '$(IMAGE_REPOSITORY)'
+              dockerfile: '**/Dockerfile'
+              containerRegistry: 'sc-acr-crwebdevcac01'
+              tags: |
+                $(Build.SourceVersion)
+                latest
 
-          # Resolve the image tag:
-          # 1) ACR-triggered tag from resources (IMAGE_TAG env)
-          # 2) manual override (MANUAL_TAG env)
-          # 3) otherwise, fail loudly
-          TAG="${IMAGE_TAG:-${MANUAL_TAG:-}}"
-          if [ -z "$TAG" ]; then
-            echo "ERROR: No image tag provided."
-            echo " - If this pipeline was manually run, supply a tag via the 'manualTag' parameter."
-            echo " - If triggered by ACR, ensure the container resource is configured and the run came from a new image push."
-            exit 1
-          fi
+          - task: Docker@2
+            displayName: 'Push image'
+            inputs:
+              command: push
+              repository: '$(IMAGE_REPOSITORY)'
+              containerRegistry: 'sc-acr-crwebdevcac01'
+              tags: |
+                $(Build.SourceVersion)
+                latest
 
-          FULL_IMAGE="$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):${TAG}"
-          echo "==> Using image: ${FULL_IMAGE}"
+          # Make the full image reference available to next stage
+          - task: Bash@3
+            name: setimage
+            displayName: 'Set image variable'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##vso[task.setvariable variable=FULL_IMAGE;isOutput=true]$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)"
+        # expose output variable for next stage
+        outputs:
+          imageRef: setimage.FULL_IMAGE
 
-          # Create namespace only if not default (you can remove this block if you always use default)
-          if [ "$(NAMESPACE)" != "default" ]; then
-            kubectl create namespace "$(NAMESPACE)" --dry-run=client -o yaml | kubectl apply -f -
-          fi
+  - stage: Deploy_AKS
+    displayName: Deploy to AKS
+    dependsOn: Build_Push
+    variables:
+      FULL_IMAGE_FROM_BUILD: $[ stageDependencies.Build_Push.Build.outputs['imageRef'] ]
+    jobs:
+      - job: Deploy
+        displayName: kubectl rollout
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: KubernetesManifest@1
+            displayName: 'Create/Update manifests (first-time safe)'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'sc-aks-web-dev-cac-01'
+              namespace: '$(K8S_NAMESPACE)'
+              manifests: |
+                k8s/deployment.yaml
+              containers: |
+                $(FULL_IMAGE_FROM_BUILD)
 
-          kubectl -n "$(NAMESPACE)" set image "deployment/$(DEPLOYMENT_NAME)" \
-            "$(CONTAINER_NAME)=${FULL_IMAGE}"
+          # (Optional) Force update deployment’s image explicitly
+          - task: Kubernetes@1
+            displayName: 'kubectl set image'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: 'sc-aks-web-dev-cac-01'
+              namespace: '$(K8S_NAMESPACE)'
+              command: 'set'
+              arguments: >
+                image deployment/$(K8S_DEPLOYMENT)
+                $(CONTAINER_NAME)=$(FULL_IMAGE_FROM_BUILD)
 
-          echo "==> Waiting for rollout"
-          kubectl -n "$(NAMESPACE)" rollout status "deployment/$(DEPLOYMENT_NAME)"
-
-          echo "==> Current image:"
-          kubectl -n "$(NAMESPACE)" get deploy "$(DEPLOYMENT_NAME)" \
-            -o jsonpath='{.spec.template.spec.containers[?(@.name=="'$(CONTAINER_NAME)'")].image}'; echo
-      # Map variables safely into env (this avoids $(...) macro tokens inside the script)
-      env:
-        IMAGE_TAG: $[ resources.containers['app'].tag ]   # present on ACR-triggered runs
-        MANUAL_TAG: ${{ parameters.manualTag }}           # present on manual runs
+          - task: Kubernetes@1
+            displayName: 'kubectl rollout status'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: 'sc-aks-web-dev-cac-01'
+              namespace: '$(K8S_NAMESPACE)'
+              command: 'rollout'
+              arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=180s'

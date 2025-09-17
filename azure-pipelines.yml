@@ -7,7 +7,7 @@ trigger:
     include:
       - '**/*'
 
-# Variables you might tweak
+# ==== Variables (adjust if needed) ====
 variables:
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
   IMAGE_REPOSITORY: 'virecintelligencevirecwebapp'
@@ -16,6 +16,7 @@ variables:
   K8S_DEPLOYMENT: 'virec-web-app'
 
 stages:
+# ==================== BUILD & PUSH ====================
   - stage: Build_Push
     displayName: Build & Push image to ACR
     jobs:
@@ -28,7 +29,7 @@ stages:
             displayName: 'Login to ACR'
             inputs:
               command: login
-              containerRegistry: 'sc-acr-crwebdevcac01'
+              containerRegistry: 'sc-acr-crwebdevcac01'   # ACR service connection
 
           - task: Docker@2
             displayName: 'Build image'
@@ -51,41 +52,30 @@ stages:
                 $(Build.SourceVersion)
                 latest
 
-          # Make the full image reference available to next stage
-          - task: Bash@3
-            name: setimage
-            displayName: 'Set image variable'
-            inputs:
-              targetType: 'inline'
-              script: |
-                echo "##vso[task.setvariable variable=FULL_IMAGE;isOutput=true]$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)"
-        # expose output variable for next stage
-        outputs:
-          imageRef: setimage.FULL_IMAGE
-
+# ==================== DEPLOY TO AKS ====================
   - stage: Deploy_AKS
     displayName: Deploy to AKS
     dependsOn: Build_Push
-    variables:
-      FULL_IMAGE_FROM_BUILD: $[ stageDependencies.Build_Push.Build.outputs['imageRef'] ]
+    condition: succeeded()
     jobs:
       - job: Deploy
-        displayName: kubectl rollout
+        displayName: Apply manifests & roll out
         pool:
           vmImage: 'ubuntu-latest'
         steps:
+          # Safe idempotent deploy: applies manifests and substitutes the image tag
           - task: KubernetesManifest@1
-            displayName: 'Create/Update manifests (first-time safe)'
+            displayName: 'Deploy manifests (with image override)'
             inputs:
               action: 'deploy'
-              kubernetesServiceConnection: 'sc-aks-web-dev-cac-01'
+              kubernetesServiceConnection: 'sc-aks-web-dev-cac-01'   # AKS service connection
               namespace: '$(K8S_NAMESPACE)'
               manifests: |
                 k8s/deployment.yaml
               containers: |
-                $(FULL_IMAGE_FROM_BUILD)
+                $(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)
 
-          # (Optional) Force update deployment’s image explicitly
+          # (Optional) Explicitly set image on the deployment to ensure a rollout
           - task: Kubernetes@1
             displayName: 'kubectl set image'
             inputs:
@@ -95,7 +85,7 @@ stages:
               command: 'set'
               arguments: >
                 image deployment/$(K8S_DEPLOYMENT)
-                $(CONTAINER_NAME)=$(FULL_IMAGE_FROM_BUILD)
+                $(CONTAINER_NAME)=$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)
 
           - task: Kubernetes@1
             displayName: 'kubectl rollout status'

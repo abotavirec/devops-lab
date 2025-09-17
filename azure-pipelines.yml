@@ -1,109 +1,79 @@
-trigger:
-  branches:
-    include:
-      - main
-      - develop
-  paths:
-    include:
-      - '**/*'
+# No CI trigger; run manually from Azure DevOps and provide the image tag
+trigger: none
 
+# ---------- Runtime parameters ----------
+parameters:
+  - name: imageRepository
+    displayName: Image repository (in ACR)
+    type: string
+    default: virecintelligencevirecwebapp
+
+  - name: imageTag
+    displayName: Image tag to deploy (e.g., commit SHA or 'latest')
+    type: string
+    default: latest
+
+  # Optional: apply a manifest if you want the pipeline to kubectl apply as well
+  - name: applyManifest
+    displayName: Also apply a Kubernetes manifest (optional)
+    type: boolean
+    default: false
+
+  - name: manifestPath
+    displayName: Manifest path (used only if applyManifest = true)
+    type: string
+    default: k8s/deployment.yaml
+
+# ---------- Static variables ----------
 variables:
+  # ACR
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
-  IMAGE_REPOSITORY: 'virecintelligencevirecwebapp'
-  CONTAINER_NAME: 'main'
+  # AKS deployment details
   K8S_NAMESPACE: 'default'
   K8S_DEPLOYMENT: 'virec-web-app'
+  CONTAINER_NAME: 'main'
+  # Service connection
+  SC_AKS: 'sc-aks-web-dev-cac-01'
 
 stages:
-  - stage: Build_Push
-    displayName: Build & Push image to ACR
-    jobs:
-      - job: Build
-        displayName: Docker build & push
-        pool:
-          vmImage: 'ubuntu-latest'
-        steps:
-          - task: Docker@2
-            displayName: 'Login to ACR'
-            inputs:
-              command: login
-              containerRegistry: 'sc-acr-crwebdevcac01'
-
-          - bash: |
-              set -euo pipefail
-              cd "$(Build.SourcesDirectory)"
-              DF="$(git ls-files | grep -E '(?i)(^|/)Dockerfile(\.[^/]+)?$' | head -n1 || true)"
-              if [ -z "$DF" ]; then
-                echo "##vso[task.logissue type=error]No Dockerfile found in repository."
-                echo "##vso[task.complete result=Failed;]"
-                exit 1
-              fi
-              echo "Discovered Dockerfile: $DF"
-              CTX="$(dirname "$DF")"
-              echo "Build context: $CTX"
-              echo "##vso[task.setvariable variable=DOCKERFILE_PATH]$DF"
-              echo "##vso[task.setvariable variable=BUILDCONTEXT_PATH]$(Build.SourcesDirectory)/$CTX"
-            displayName: 'Detect Dockerfile & context'
-
-          - task: Docker@2
-            displayName: 'Build image'
-            inputs:
-              command: build
-              containerRegistry: 'sc-acr-crwebdevcac01'
-              repository: '$(IMAGE_REPOSITORY)'
-              dockerfile: '$(DOCKERFILE_PATH)'
-              buildContext: '$(BUILDCONTEXT_PATH)'
-              tags: |
-                $(Build.SourceVersion)
-                latest
-
-          - task: Docker@2
-            displayName: 'Push image'
-            inputs:
-              command: push
-              containerRegistry: 'sc-acr-crwebdevcac01'
-              repository: '$(IMAGE_REPOSITORY)'
-              tags: |
-                $(Build.SourceVersion)
-                latest
-
   - stage: Deploy_AKS
-    displayName: Deploy to AKS
-    dependsOn: Build_Push
-    condition: succeeded()
+    displayName: Deploy pre-built image to AKS
     jobs:
       - job: Deploy
-        displayName: Apply manifests & roll out
+        displayName: Rollout $(K8S_DEPLOYMENT) to ${{ parameters.imageRepository }}:${{ parameters.imageTag }}
         pool:
           vmImage: 'ubuntu-latest'
         steps:
+          # Optional "apply" if you want to manage the manifest via this pipeline
           - task: KubernetesManifest@1
-            displayName: 'Deploy manifests (with image override)'
+            displayName: 'Apply manifests (optional)'
+            condition: and(succeeded(), eq('${{ parameters.applyManifest }}', 'true'))
             inputs:
               action: 'deploy'
-              kubernetesServiceConnection: 'sc-aks-web-dev-cac-01'
+              kubernetesServiceConnection: '$(SC_AKS)'
               namespace: '$(K8S_NAMESPACE)'
               manifests: |
-                k8s/deployment.yaml
+                ${{ parameters.manifestPath }}
               containers: |
-                $(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)
+                $(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
 
+          # Always set the image on the existing Deployment to force a rollout
           - task: Kubernetes@1
-            displayName: 'kubectl set image'
+            displayName: 'kubectl set image on $(K8S_DEPLOYMENT)'
             inputs:
               connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceEndpoint: 'sc-aks-web-dev-cac-01'
+              kubernetesServiceEndpoint: '$(SC_AKS)'
               namespace: '$(K8S_NAMESPACE)'
               command: 'set'
               arguments: >
                 image deployment/$(K8S_DEPLOYMENT)
-                $(CONTAINER_NAME)=$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)
+                $(CONTAINER_NAME)=$(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
 
           - task: Kubernetes@1
             displayName: 'kubectl rollout status'
             inputs:
               connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceEndpoint: 'sc-aks-web-dev-cac-01'
+              kubernetesServiceEndpoint: '$(SC_AKS)'
               namespace: '$(K8S_NAMESPACE)'
               command: 'rollout'
               arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=180s'

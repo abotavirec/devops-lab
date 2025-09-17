@@ -1,44 +1,40 @@
-
 # ---------- CI & PR Triggers ----------
 trigger:
   branches:
-    include:
-      - main
-
+    include: [ main ]
 pr:
   branches:
-    include:
-      - main
+    include: [ main ]
 
 # ---------- Runtime Parameters ----------
 parameters:
   - name: imageRepository
     displayName: Image repository (in ACR)
     type: string
-    default: virecintelligencevirecwebapp
+    default: webapp                  # was: virecintelligencevirecwebapp
 
   - name: imageTag
     displayName: Image tag to deploy (e.g., commit SHA or 'latest')
     type: string
-    default: latest
+    default: $(Build.SourceVersion)   # safer than 'latest'
 
   - name: applyManifest
     displayName: Also apply a Kubernetes manifest (optional)
     type: boolean
-    default: false
+    default: true                     # ensure the Deployment exists
 
   - name: manifestPath
     displayName: Manifest path (used only if applyManifest = true)
     type: string
-    default: k8s/deployment.yaml
+    default: manifests/deployment.yaml
 
 # ---------- Static Variables ----------
 variables:
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
-  K8S_NAMESPACE: 'default'
-  K8S_DEPLOYMENT: 'virec-web-app'
-  CONTAINER_NAME: 'main'
-  SC_AKS: 'sc-aks-web-dev-cac-01'
+  K8S_NAMESPACE: 'web-dev'            # match your cluster usage
+  K8S_DEPLOYMENT: 'webapp'            # MUST match metadata.name in your Deployment
+  CONTAINER_NAME: 'webapp'            # MUST match spec.template.spec.containers[0].name
+  SC_AKS: 'sc-aks-web-dev-cac-01'     # your service connection
 
 # ---------- Deployment Stage ----------
 stages:
@@ -50,8 +46,9 @@ stages:
         pool:
           vmImage: 'ubuntu-latest'
         steps:
+          - checkout: self
 
-          # Optional manifest apply
+          # (Optional) apply the Deployment manifest so the resource exists
           - task: KubernetesManifest@1
             displayName: 'Apply Kubernetes manifest (if enabled)'
             condition: and(succeeded(), eq(${{ parameters.applyManifest }}, true))
@@ -63,8 +60,9 @@ stages:
                 ${{ parameters.manifestPath }}
               containers: |
                 $(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
+              rolloutStatusTimeout: '300'
 
-          # Force rollout by setting image
+          # Force rollout by setting image (idempotent if manifest already applied)
           - task: Kubernetes@1
             displayName: 'Set image on deployment $(K8S_DEPLOYMENT)'
             inputs:
@@ -73,7 +71,8 @@ stages:
               namespace: '$(K8S_NAMESPACE)'
               command: 'set'
               arguments: >
-                image deployment/$(K8S_DEPLOYMENT) $(CONTAINER_NAME)=$(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
+                image deployment/$(K8S_DEPLOYMENT)
+                $(CONTAINER_NAME)=$(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
 
           # Wait for rollout to complete
           - task: Kubernetes@1
@@ -83,4 +82,4 @@ stages:
               kubernetesServiceEndpoint: '$(SC_AKS)'
               namespace: '$(K8S_NAMESPACE)'
               command: 'rollout'
-              arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=180s'
+              arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=300s'

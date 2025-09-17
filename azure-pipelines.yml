@@ -1,5 +1,9 @@
-# No CI trigger; run manually from Azure DevOps and provide the image tag
-trigger: none
+
+# ---------- CI Trigger ----------
+trigger:
+  branches:
+    include:
+      - main  # Change to your desired branch
 
 # ---------- Runtime parameters ----------
 parameters:
@@ -13,7 +17,6 @@ parameters:
     type: string
     default: latest
 
-  # Optional: apply a manifest if you want the pipeline to kubectl apply as well
   - name: applyManifest
     displayName: Also apply a Kubernetes manifest (optional)
     type: boolean
@@ -26,15 +29,13 @@ parameters:
 
 # ---------- Static variables ----------
 variables:
-  # ACR
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
-  # AKS deployment details
   K8S_NAMESPACE: 'default'
   K8S_DEPLOYMENT: 'virec-web-app'
   CONTAINER_NAME: 'main'
-  # Service connection
   SC_AKS: 'sc-aks-web-dev-cac-01'
 
+# ---------- Deployment Stage ----------
 stages:
   - stage: Deploy_AKS
     displayName: Deploy pre-built image to AKS
@@ -44,9 +45,10 @@ stages:
         pool:
           vmImage: 'ubuntu-latest'
         steps:
-          # Optional "apply" if you want to manage the manifest via this pipeline
+
+          # Optional manifest apply
           - task: KubernetesManifest@1
-            displayName: 'Apply manifests (optional)'
+            displayName: 'Apply Kubernetes manifest (if enabled)'
             condition: and(succeeded(), eq('${{ parameters.applyManifest }}', 'true'))
             inputs:
               action: 'deploy'
@@ -57,20 +59,20 @@ stages:
               containers: |
                 $(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
 
-          # Always set the image on the existing Deployment to force a rollout
+          # Force rollout by setting image
           - task: Kubernetes@1
-            displayName: 'kubectl set image on $(K8S_DEPLOYMENT)'
+            displayName: 'Set image on deployment $(K8S_DEPLOYMENT)'
             inputs:
               connectionType: 'Kubernetes Service Connection'
               kubernetesServiceEndpoint: '$(SC_AKS)'
               namespace: '$(K8S_NAMESPACE)'
               command: 'set'
               arguments: >
-                image deployment/$(K8S_DEPLOYMENT)
-                $(CONTAINER_NAME)=$(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
+                image deployment/$(K8S_DEPLOYMENT) $(CONTAINER_NAME)=$(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
 
+          # Wait for rollout to complete
           - task: Kubernetes@1
-            displayName: 'kubectl rollout status'
+            displayName: 'Check rollout status'
             inputs:
               connectionType: 'Kubernetes Service Connection'
               kubernetesServiceEndpoint: '$(SC_AKS)'

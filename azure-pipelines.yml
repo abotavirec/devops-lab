@@ -7,7 +7,6 @@ trigger:
     include:
       - '**/*'
 
-# ==== Variables (adjust if needed) ====
 variables:
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
   IMAGE_REPOSITORY: 'virecintelligencevirecwebapp'
@@ -16,7 +15,6 @@ variables:
   K8S_DEPLOYMENT: 'virec-web-app'
 
 stages:
-# ==================== BUILD & PUSH ====================
   - stage: Build_Push
     displayName: Build & Push image to ACR
     jobs:
@@ -29,15 +27,32 @@ stages:
             displayName: 'Login to ACR'
             inputs:
               command: login
-              containerRegistry: 'sc-acr-crwebdevcac01'   # ACR service connection
+              containerRegistry: 'sc-acr-crwebdevcac01'
+
+          - bash: |
+              set -euo pipefail
+              cd "$(Build.SourcesDirectory)"
+              DF="$(git ls-files | grep -E '(?i)(^|/)Dockerfile(\.[^/]+)?$' | head -n1 || true)"
+              if [ -z "$DF" ]; then
+                echo "##vso[task.logissue type=error]No Dockerfile found in repository."
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              fi
+              echo "Discovered Dockerfile: $DF"
+              CTX="$(dirname "$DF")"
+              echo "Build context: $CTX"
+              echo "##vso[task.setvariable variable=DOCKERFILE_PATH]$DF"
+              echo "##vso[task.setvariable variable=BUILDCONTEXT_PATH]$(Build.SourcesDirectory)/$CTX"
+            displayName: 'Detect Dockerfile & context'
 
           - task: Docker@2
             displayName: 'Build image'
             inputs:
               command: build
-              repository: '$(IMAGE_REPOSITORY)'
-              dockerfile: '**/Dockerfile'
               containerRegistry: 'sc-acr-crwebdevcac01'
+              repository: '$(IMAGE_REPOSITORY)'
+              dockerfile: '$(DOCKERFILE_PATH)'
+              buildContext: '$(BUILDCONTEXT_PATH)'
               tags: |
                 $(Build.SourceVersion)
                 latest
@@ -46,13 +61,12 @@ stages:
             displayName: 'Push image'
             inputs:
               command: push
-              repository: '$(IMAGE_REPOSITORY)'
               containerRegistry: 'sc-acr-crwebdevcac01'
+              repository: '$(IMAGE_REPOSITORY)'
               tags: |
                 $(Build.SourceVersion)
                 latest
 
-# ==================== DEPLOY TO AKS ====================
   - stage: Deploy_AKS
     displayName: Deploy to AKS
     dependsOn: Build_Push
@@ -63,19 +77,17 @@ stages:
         pool:
           vmImage: 'ubuntu-latest'
         steps:
-          # Safe idempotent deploy: applies manifests and substitutes the image tag
           - task: KubernetesManifest@1
             displayName: 'Deploy manifests (with image override)'
             inputs:
               action: 'deploy'
-              kubernetesServiceConnection: 'sc-aks-web-dev-cac-01'   # AKS service connection
+              kubernetesServiceConnection: 'sc-aks-web-dev-cac-01'
               namespace: '$(K8S_NAMESPACE)'
               manifests: |
                 k8s/deployment.yaml
               containers: |
                 $(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)
 
-          # (Optional) Explicitly set image on the deployment to ensure a rollout
           - task: Kubernetes@1
             displayName: 'kubectl set image'
             inputs:

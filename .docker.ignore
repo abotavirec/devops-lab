@@ -1,7 +1,23 @@
-**/bin/
-**/obj/
-.git/
+# VCS
+.git
 .gitignore
-.azure-pipelines.yml
+
+# Node
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store
+
+# Next.js
+.next/cache
+.next/trace
+.next/types
+.next/output
+out
+.cache
+
+# Misc
 Dockerfile
 README.md
+.azure-pipelines.yml

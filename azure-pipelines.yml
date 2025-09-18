@@ -20,6 +20,7 @@ parameters:
 
 # ---------- Static Variables ----------
 variables:
+  SYSTEM_DEBUG: true
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
   K8S_NAMESPACE: 'default'
   K8S_DEPLOYMENT: 'virec-web-app'
@@ -85,6 +86,19 @@ stages:
               echo "$PASSWORD" | docker login "$ACR_FQDN" -u "$USERNAME" --password-stdin
               docker info || true
               set +x
+
+        # ------------------ NEW: Smoke push to ACR ------------------
+        - bash: |
+            set -euo pipefail
+            ACR_FQDN="$(ACR_LOGIN_SERVER)"
+            REPO='${{ parameters.imageRepository }}'
+            echo "== Smoke test push to $ACR_FQDN/$REPO/alpine-test:probe =="
+
+            docker pull alpine:3.20
+            docker tag alpine:3.20 "$ACR_FQDN/$REPO/alpine-test:probe"
+            docker push "$ACR_FQDN/$REPO/alpine-test:probe"
+          displayName: 'Smoke test: docker push to ACR (alpine)'
+        # ------------------------------------------------------------
 
         - bash: |
             set -euo pipefail

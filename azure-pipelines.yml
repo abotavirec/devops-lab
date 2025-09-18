@@ -14,7 +14,7 @@ parameters:
 
   - name: imageTag
     type: string
-    default: 'latest'  # set the image tag you want to deploy (e.g., a commit SHA)
+    default: 'latest'  # e.g., a commit SHA or 'latest'
 
   - name: manifestPath
     type: string
@@ -34,7 +34,6 @@ variables:
 
 # =================== STAGES =====================
 stages:
-
 - stage: Deploy
   displayName: Deploy to AKS using prebuilt image
   jobs:
@@ -43,7 +42,6 @@ stages:
       pool:
         vmImage: 'ubuntu-latest'
       steps:
-
         - bash: |
             set -euo pipefail
             IMAGE="$(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}"
@@ -51,15 +49,17 @@ stages:
             echo "##vso[task.setvariable variable=DEPLOY_IMAGE]$IMAGE"
           displayName: 'Set DEPLOY_IMAGE variable'
 
+        # RBAC check - FIXED: use 'auth' (valid kubectl subcommand)
         - task: Kubernetes@1
           displayName: 'Check RBAC: can patch deployment'
           inputs:
             connectionType: 'Kubernetes Service Connection'
             kubernetesServiceEndpoint: '$(SC_AKS)'
             namespace: '$(K8S_NAMESPACE)'
-            command: custom
-            arguments: 'auth can-i patch deployment -n $(K8S_NAMESPACE)'
+            command: auth
+            arguments: 'can-i patch deployment -n $(K8S_NAMESPACE)'
 
+        # Apply manifest and inject image
         - task: KubernetesManifest@1
           displayName: 'Apply manifest (if enabled)'
           condition: and(succeeded(), eq(${{ parameters.applyManifest }}, true))
@@ -73,8 +73,9 @@ stages:
               $(DEPLOY_IMAGE)
             rolloutStatusTimeout: '300'
 
+        # Safety net: ensure the image is set on the Deployment (idempotent)
         - task: Kubernetes@1
-          displayName: 'Force set image on deployment (safety net)'
+          displayName: 'Force set image on deployment'
           inputs:
             connectionType: 'Kubernetes Service Connection'
             kubernetesServiceEndpoint: '$(SC_AKS)'
@@ -84,6 +85,7 @@ stages:
               image deployment/$(K8S_DEPLOYMENT)
               $(CONTAINER_NAME)=$(DEPLOY_IMAGE)
 
+        # Wait for rollout to complete
         - task: Kubernetes@1
           displayName: 'Wait for rollout'
           inputs:
@@ -93,17 +95,19 @@ stages:
             command: rollout
             arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=600s'
 
-        - task: Kubernetes@1
+        # Diagnostics on failure - FIXED: run multiple commands via Bash
+        - task: Bash@3
           displayName: 'Diagnostics (on failure)'
           condition: failed()
           inputs:
-            connectionType: 'Kubernetes Service Connection'
-            kubernetesServiceEndpoint: '$(SC_AKS)'
-            namespace: '$(K8S_NAMESPACE)'
-            command: custom
-            arguments: >
-              bash -c "
-                kubectl describe deploy/$(K8S_DEPLOYMENT);
-                kubectl get pods -l app=virec-web-app -o wide;
-                kubectl describe pod $(kubectl get pods -l app=virec-web-app -o jsonpath='{.items[0].metadata.name}' || true);
-                kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50
+            targetType: inline
+            script: |
+              set -x
+              kubectl describe deploy/$(K8S_DEPLOYMENT) -n $(K8S_NAMESPACE)
+              kubectl get pods -l app=virec-web-app -n $(K8S_NAMESPACE) -o wide || true
+              POD="$(kubectl get pods -l app=virec-web-app -n $(K8S_NAMESPACE) -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+              if [ -n "$POD" ]; then
+                kubectl describe pod "$POD" -n $(K8S_NAMESPACE) || true
+                kubectl logs "$POD" -n $(K8S_NAMESPACE) --tail=200 || true
+              fi
+              kubectl get events -n $(K8S_NAMESPACE) --sort-by=.metadata.creationTimestamp | tail -n 50 || true

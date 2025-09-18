@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: main
-          image: crwebdevcac01.azurecr.io/virecintelligencevirecwebapp:latest
+          image: crwebdevcac01.azurecr.io/virecintelligencevirecwebapp:latest  # placeholder; pipeline sets the real tag
           imagePullPolicy: Always
           ports:
             - containerPort: 80

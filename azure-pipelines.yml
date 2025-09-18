@@ -64,6 +64,34 @@ stages:
             fi
           displayName: 'Ensure jq is installed'
 
+        # ---------- Install Docker Buildx plugin (if missing) ----------
+        - bash: |
+            set -euo pipefail
+            BUILDX_VERSION="v0.11.2"  # pick a stable release
+            if ! docker buildx version >/dev/null 2>&1; then
+              echo "Installing docker-buildx ${BUILDX_VERSION}..."
+              mkdir -p ~/.docker/cli-plugins
+              curl -sSL \
+                "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64" \
+                -o ~/.docker/cli-plugins/docker-buildx
+              chmod +x ~/.docker/cli-plugins/docker-buildx
+            fi
+            echo "== Buildx version =="
+            docker buildx version
+          displayName: 'Install Docker Buildx (if needed)'
+
+        # ---------- Create/Use a buildx builder & bootstrap BuildKit ----------
+        - bash: |
+            set -euo pipefail
+            echo "Preparing buildx builder..."
+            if ! docker buildx inspect builder >/dev/null 2>&1; then
+              docker buildx create --name builder --use
+            else
+              docker buildx use builder
+            fi
+            docker buildx inspect --bootstrap
+          displayName: 'Enable Buildx builder'
+
         - task: AzureCLI@2
           displayName: 'Azure: login & ACR health / docker login (AAD token)'
           inputs:
@@ -100,7 +128,7 @@ stages:
             echo "== Smoke push: $ACR_FQDN/$REPO/alpine-test:$PROBE =="
             docker pull alpine:3.20
             docker tag alpine:3.20 "$ACR_FQDN/$REPO/alpine-test:$PROBE"
-            docker push "$ACR_FQDN/$REPO/alpine-test:$PROBE"
+            docker push "$ACR_FQDN/$REPO/alpine-test:$PROBE" || { echo "❌ ACR smoke push failed"; exit 15; }
           displayName: 'Smoke test: docker push to ACR (alpine)'
 
         - bash: |
@@ -109,15 +137,6 @@ stages:
             ACR="${ACR_LOGIN_SERVER}"
             REPO='${{ parameters.imageRepository }}'
             TAG='$(setvars.IMAGE_TAG)'
-
-            echo "Preparing buildx..."
-            docker buildx version || true
-            if ! docker buildx inspect builder >/dev/null 2>&1; then
-              docker buildx create --name builder --use
-            else
-              docker buildx use builder
-            fi
-            docker buildx inspect --bootstrap
 
             echo "== buildx build & push ($ACR/$REPO:$TAG and :latest) =="
             set +e
@@ -256,6 +275,7 @@ stages:
               set -x
               NS='${{ parameters.deployNamespace }}'
               kubectl describe deploy/$(K8S_DEPLOYMENT) -n "$NS" || true
+              kubectl get ingress,svc -n "$NS" -o wide || true
               kubectl get rs -n "$NS" -l app=virec-web-app -o wide || true
               kubectl get pods -n "$NS" -l app=virec-web-app -o wide || true
               POD="$(kubectl get pods -n "$NS" -l app=virec-web-app -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"

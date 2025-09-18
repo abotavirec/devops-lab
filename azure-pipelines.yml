@@ -31,9 +31,9 @@ parameters:
 # ---------- Static Variables ----------
 variables:
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
-  K8S_NAMESPACE: 'web-dev'            # match your cluster usage
-  K8S_DEPLOYMENT: 'webapp'            # MUST match metadata.name in your Deployment
-  CONTAINER_NAME: 'webapp'            # MUST match spec.template.spec.containers[0].name
+  K8S_NAMESPACE: 'default'            # match your cluster usage
+  K8S_DEPLOYMENT: 'virec-web-app'            # MUST match metadata.name in your Deployment
+  CONTAINER_NAME: 'main'            # MUST match spec.template.spec.containers[0].name
   SC_AKS: 'sc-aks-web-dev-cac-01'     # your service connection
 
 # ---------- Deployment Stage ----------

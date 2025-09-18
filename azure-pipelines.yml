@@ -24,8 +24,8 @@ variables:
   K8S_NAMESPACE: 'default'
   K8S_DEPLOYMENT: 'virec-web-app'
   CONTAINER_NAME: 'main'
-  SC_AKS: 'sc-aks-web-dev-cac-01'                  # Kubernetes service connection
-  SC_AZURE: 'sc-azure-rg-sw-web-dev-cac-01'        # ARM service connection for ACR login
+  SC_AKS: 'sc-aks-web-dev-cac-01'                  # Kubernetes service connection (to AKS)
+  SC_AZURE: 'sc-azure-rg-sw-web-dev-cac-01'        # ARM service connection (to ACR subscription)
 
 # ======================= STAGES =======================
 stages:
@@ -49,7 +49,6 @@ stages:
           name: setvars
           displayName: "Set IMAGE_TAG to commit SHA"
 
-        # jq is usually present, but install just in case
         - bash: |
             set -euo pipefail
             if ! command -v jq >/dev/null 2>&1; then
@@ -59,41 +58,50 @@ stages:
           displayName: 'Ensure jq is installed'
 
         - task: AzureCLI@2
-          displayName: 'Azure: login & ACR docker login (AAD token)'
+          displayName: 'Azure: login & ACR health / docker login (AAD token)'
           inputs:
             azureSubscription: '$(SC_AZURE)'
             scriptType: bash
             scriptLocation: inlineScript
             inlineScript: |
               set -euo pipefail
-              ACR_FQDN="$(ACR_LOGIN_SERVER)"         # e.g. crwebdevcac01.azurecr.io
-              ACR_NAME="${ACR_FQDN%%.*}"             # e.g. crwebdevcac01
+              set -x
+              ACR_FQDN="$(ACR_LOGIN_SERVER)"      # e.g. crwebdevcac01.azurecr.io
+              ACR_NAME="${ACR_FQDN%%.*}"          # e.g. crwebdevcac01
 
-              echo "Using ACR_FQDN=$ACR_FQDN  ACR_NAME=$ACR_NAME"
+              echo "== Az account =="
               az account show -o table
 
-              echo "Fetching AAD access token for Docker login..."
+              echo "== ACR health =="
+              az acr check-health --name "$ACR_NAME" --yes || true
+
+              echo "== Get AAD token & docker login =="
               TOKEN_JSON=$(az acr login --name "$ACR_NAME" --expose-token -o json)
+              echo "$TOKEN_JSON" | jq -r '. | {username, accessToken}'
+
               USERNAME=$(echo "$TOKEN_JSON" | jq -r '.username')
               PASSWORD=$(echo "$TOKEN_JSON" | jq -r '.accessToken')
 
               echo "$PASSWORD" | docker login "$ACR_FQDN" -u "$USERNAME" --password-stdin
-              echo "Docker login succeeded."
-
               docker info || true
+              set +x
 
         - bash: |
             set -euo pipefail
-            export BUILDKIT_PROGRESS=plain   # readable logs
+            set -x
+            export BUILDKIT_PROGRESS=plain
 
             ACR="${ACR_LOGIN_SERVER}"
             REPO='${{ parameters.imageRepository }}'
             TAG='$(setvars.IMAGE_TAG)'
 
-            if [[ -z "$REPO" || -z "$TAG" ]]; then
-              echo "REPO or TAG is empty. REPO='$REPO' TAG='$TAG'"
-              exit 20
-            fi
+            # Validate inputs
+            [[ -n "$REPO" && -n "$TAG" ]] || { echo "Empty REPO or TAG"; exit 20; }
+
+            echo "== Context listing (top-level) =="
+            ls -alh
+            echo "== Dockerfile (head) =="
+            head -n 60 Dockerfile || true
 
             echo "Preparing buildx..."
             docker buildx version || true
@@ -104,27 +112,37 @@ stages:
             fi
             docker buildx inspect --bootstrap
 
-            echo "Building $ACR/$REPO:$TAG and :latest (linux/amd64)..."
+            echo "== buildx build & push ($ACR/$REPO:$TAG and :latest) =="
             set +e
             docker buildx build \
               --push \
               --platform linux/amd64 \
               -t "$ACR/$REPO:$TAG" \
               -t "$ACR/$REPO:latest" \
-              .
-            BX_RC=$?
+              . 2>&1 | tee buildx.log
+            BX_RC=${PIPESTATUS[0]}
             set -e
 
             if [[ $BX_RC -ne 0 ]]; then
               echo "buildx failed with code $BX_RC — falling back to classic docker build/push"
-              docker build -t "$ACR/$REPO:$TAG" -t "$ACR/$REPO:latest" .
-              docker push "$ACR/$REPO:$TAG"
-              docker push "$ACR/$REPO:latest"
+              docker build -t "$ACR/$REPO:$TAG" -t "$ACR/$REPO:latest" . 2>&1 | tee build_classic.log
+              docker push "$ACR/$REPO:$TAG"   2>&1 | tee push_tag.log
+              docker push "$ACR/$REPO:latest" 2>&1 | tee push_latest.log
             fi
 
-            echo "Images in local cache (top 20):"
+            echo "== Local images (top 20) =="
             docker images | head -n 20 || true
-          displayName: 'Build & push image (with buildx + fallback)'
+            set +x
+          displayName: 'Build & push image (diagnostic + fallback)'
+
+        # Always publish logs for troubleshooting
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish build logs (always)'
+          condition: always()
+          inputs:
+            PathtoPublish: '$(System.DefaultWorkingDirectory)'
+            ArtifactName: 'build-logs'
+            publishLocation: 'Container'
 
         - task: Bash@3
           name: publish_meta

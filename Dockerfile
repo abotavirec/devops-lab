@@ -2,30 +2,36 @@
 # BUILD STAGE
 # ---------------------------
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+
+# Build args tell us which project to build
+ARG PROJECT_PATH=src/WebApp/WebApp.csproj
+
+# Restore + publish
 WORKDIR /src
-
-# Copy csproj and restore as distinct layers
-COPY *.csproj ./
-RUN dotnet restore
-
-# Copy everything and build
 COPY . .
-RUN dotnet publish -c Release -o /app/out
+# Sanity: fail early if the project path is wrong
+RUN test -f "$PROJECT_PATH" || (echo "ERROR: PROJECT_PATH '$PROJECT_PATH' not found"; ls -laR /src; exit 2)
+
+# Restore & publish to a deterministic output
+RUN dotnet restore "$PROJECT_PATH"
+RUN dotnet publish "$PROJECT_PATH" -c Release -o /app/out --no-restore
 
 # ---------------------------
 # RUNTIME STAGE
 # ---------------------------
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 WORKDIR /app
-
-# Expose port 80 (matches your deployment.yaml)
 EXPOSE 80
 
-# Copy published output from build stage
-COPY --from=build /app/out .
-
-# Set the URL binding (same as your manifest’s env var)
+# App binds to 80 (matches your k8s manifest)
 ENV ASPNETCORE_URLS=http://+:80
 
+# Copy published app
+COPY --from=build /app/out /app/out
+
+# Project dll name (e.g., virecintelligencevirecwebapp.dll)
+ARG PROJECT_DLL=virecintelligencevirecwebappp.dll
+ENV PROJECT_DLL=${PROJECT_DLL}
+
 # Start the app
-ENTRYPOINT ["dotnet", "virecintelligencevirecwebapp.dll"]
+CMD ["sh", "-c", "exec dotnet /app/out/$PROJECT_DLL"]

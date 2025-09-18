@@ -29,6 +29,7 @@ variables:
 
 # ======================= STAGES =======================
 stages:
+
 # -------------------- BUILD & PUSH --------------------
 - stage: Build
   displayName: Build & Push Image
@@ -42,38 +43,88 @@ stages:
           fetchDepth: 0
 
         - bash: |
+            set -euo pipefail
             echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(Build.SourceVersion)"
             echo "Resolved IMAGE_TAG=$(Build.SourceVersion)"
           name: setvars
           displayName: "Set IMAGE_TAG to commit SHA"
 
+        # jq is usually present, but install just in case
+        - bash: |
+            set -euo pipefail
+            if ! command -v jq >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y jq
+            fi
+          displayName: 'Ensure jq is installed'
+
         - task: AzureCLI@2
-          displayName: 'Login to ACR'
+          displayName: 'Azure: login & ACR docker login (AAD token)'
           inputs:
             azureSubscription: '$(SC_AZURE)'
             scriptType: bash
             scriptLocation: inlineScript
             inlineScript: |
-              ACR_NAME=${ACR_LOGIN_SERVER%%.*}
-              az acr login --name $ACR_NAME
+              set -euo pipefail
+              ACR_FQDN="$(ACR_LOGIN_SERVER)"         # e.g. crwebdevcac01.azurecr.io
+              ACR_NAME="${ACR_FQDN%%.*}"             # e.g. crwebdevcac01
+
+              echo "Using ACR_FQDN=$ACR_FQDN  ACR_NAME=$ACR_NAME"
+              az account show -o table
+
+              echo "Fetching AAD access token for Docker login..."
+              TOKEN_JSON=$(az acr login --name "$ACR_NAME" --expose-token -o json)
+              USERNAME=$(echo "$TOKEN_JSON" | jq -r '.username')
+              PASSWORD=$(echo "$TOKEN_JSON" | jq -r '.accessToken')
+
+              echo "$PASSWORD" | docker login "$ACR_FQDN" -u "$USERNAME" --password-stdin
+              echo "Docker login succeeded."
+
+              docker info || true
 
         - bash: |
-            docker version
-            docker buildx create --use --name builder || true
-            docker buildx use builder
+            set -euo pipefail
+            export BUILDKIT_PROGRESS=plain   # readable logs
 
-            ACR=$(ACR_LOGIN_SERVER)
+            ACR="${ACR_LOGIN_SERVER}"
             REPO='${{ parameters.imageRepository }}'
             TAG='$(setvars.IMAGE_TAG)'
 
-            echo "Building $ACR/$REPO:$TAG and :latest"
+            if [[ -z "$REPO" || -z "$TAG" ]]; then
+              echo "REPO or TAG is empty. REPO='$REPO' TAG='$TAG'"
+              exit 20
+            fi
+
+            echo "Preparing buildx..."
+            docker buildx version || true
+            if ! docker buildx inspect builder >/dev/null 2>&1; then
+              docker buildx create --name builder --use
+            else
+              docker buildx use builder
+            fi
+            docker buildx inspect --bootstrap
+
+            echo "Building $ACR/$REPO:$TAG and :latest (linux/amd64)..."
+            set +e
             docker buildx build \
               --push \
               --platform linux/amd64 \
-              -t $ACR/$REPO:$TAG \
-              -t $ACR/$REPO:latest \
+              -t "$ACR/$REPO:$TAG" \
+              -t "$ACR/$REPO:latest" \
               .
-          displayName: 'Buildx: build & push (SHA + latest)'
+            BX_RC=$?
+            set -e
+
+            if [[ $BX_RC -ne 0 ]]; then
+              echo "buildx failed with code $BX_RC — falling back to classic docker build/push"
+              docker build -t "$ACR/$REPO:$TAG" -t "$ACR/$REPO:latest" .
+              docker push "$ACR/$REPO:$TAG"
+              docker push "$ACR/$REPO:latest"
+            fi
+
+            echo "Images in local cache (top 20):"
+            docker images | head -n 20 || true
+          displayName: 'Build & push image (with buildx + fallback)'
 
         - task: Bash@3
           name: publish_meta
@@ -81,9 +132,11 @@ stages:
           inputs:
             targetType: inline
             script: |
+              set -euo pipefail
               echo "repo=${{ parameters.imageRepository }}"     > image_meta.env
               echo "tag=$(setvars.IMAGE_TAG)"                  >> image_meta.env
               echo "registry=$(ACR_LOGIN_SERVER)"              >> image_meta.env
+              echo "----- image_meta.env -----"
               cat image_meta.env
 
         - publish: $(System.DefaultWorkingDirectory)/image_meta.env
@@ -103,6 +156,7 @@ stages:
           artifact: image_meta
 
         - bash: |
+            set -euo pipefail
             source "$(Pipeline.Workspace)/image_meta/image_meta.env"
             echo "Deploying $registry/$repo:$tag"
             echo "##vso[task.setvariable variable=DEPLOY_IMAGE]$registry/$repo:$tag"

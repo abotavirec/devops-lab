@@ -82,4 +82,4 @@ stages:
               kubernetesServiceEndpoint: '$(SC_AKS)'
               namespace: '$(K8S_NAMESPACE)'
               command: 'rollout'
-              arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=300s'
+              arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=600s'

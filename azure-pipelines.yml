@@ -1,4 +1,4 @@
-# ---------- CI & PR Triggers ----------
+# ------------------- TRIGGERS -------------------
 trigger:
   branches:
     include: [ main ]
@@ -6,197 +6,53 @@ pr:
   branches:
     include: [ main ]
 
-# ---------- Runtime Parameters ----------
+# ----------------- PARAMETERS -------------------
 parameters:
   - name: imageRepository
     type: string
-    default: 'virecintelligencevirecwebapp'   # align to your ACR repo
+    default: 'virecintelligencevirecwebapp'  # your ACR repository name
+
+  - name: imageTag
+    type: string
+    default: 'latest'  # set the image tag you want to deploy (e.g., a commit SHA)
+
   - name: manifestPath
     type: string
-    default: 'k8s/deployment.yaml'
+    default: 'k8s/deployment.yaml'  # path to your Kubernetes deployment manifest
+
   - name: applyManifest
     type: boolean
     default: true
 
-# ---------- Static Variables ----------
+# ----------------- VARIABLES --------------------
 variables:
-  SYSTEM_DEBUG: true
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
   K8S_NAMESPACE: 'default'
   K8S_DEPLOYMENT: 'virec-web-app'
   CONTAINER_NAME: 'main'
-  SC_AKS: 'sc-aks-web-dev-cac-01'                  # Kubernetes service connection (to AKS)
-  SC_AZURE: 'sc-azure-rg-sw-web-dev-cac-01'        # ARM service connection (to ACR subscription)
+  SC_AKS: 'sc-aks-web-dev-cac-01'  # Kubernetes service connection
 
-# ======================= STAGES =======================
+# =================== STAGES =====================
 stages:
 
-# -------------------- BUILD & PUSH --------------------
-- stage: Build
-  displayName: Build & Push Image
-  jobs:
-    - job: DockerBuild
-      displayName: Docker buildx + push to ACR
-      pool:
-        vmImage: 'ubuntu-latest'
-      steps:
-        - checkout: self
-          fetchDepth: 0
-
-        - bash: |
-            set -euo pipefail
-            echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(Build.SourceVersion)"
-            echo "Resolved IMAGE_TAG=$(Build.SourceVersion)"
-          name: setvars
-          displayName: "Set IMAGE_TAG to commit SHA"
-
-        - bash: |
-            set -euo pipefail
-            if ! command -v jq >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo apt-get install -y jq
-            fi
-          displayName: 'Ensure jq is installed'
-
-        - task: AzureCLI@2
-          displayName: 'Azure: login & ACR health / docker login (AAD token)'
-          inputs:
-            azureSubscription: '$(SC_AZURE)'
-            scriptType: bash
-            scriptLocation: inlineScript
-            inlineScript: |
-              set -euo pipefail
-              set -x
-              ACR_FQDN="$(ACR_LOGIN_SERVER)"      # e.g. crwebdevcac01.azurecr.io
-              ACR_NAME="${ACR_FQDN%%.*}"          # e.g. crwebdevcac01
-
-              echo "== Az account =="
-              az account show -o table
-
-              echo "== ACR health =="
-              az acr check-health --name "$ACR_NAME" --yes || true
-
-              echo "== Get AAD token & docker login =="
-              TOKEN_JSON=$(az acr login --name "$ACR_NAME" --expose-token -o json)
-              echo "$TOKEN_JSON" | jq -r '. | {username, accessToken}'
-
-              USERNAME=$(echo "$TOKEN_JSON" | jq -r '.username')
-              PASSWORD=$(echo "$TOKEN_JSON" | jq -r '.accessToken')
-
-              echo "$PASSWORD" | docker login "$ACR_FQDN" -u "$USERNAME" --password-stdin
-              docker info || true
-              set +x
-
-        # ------------------ NEW: Smoke push to ACR ------------------
-        - bash: |
-            set -euo pipefail
-            ACR_FQDN="$(ACR_LOGIN_SERVER)"
-            REPO='${{ parameters.imageRepository }}'
-            echo "== Smoke test push to $ACR_FQDN/$REPO/alpine-test:probe =="
-
-            docker pull alpine:3.20
-            docker tag alpine:3.20 "$ACR_FQDN/$REPO/alpine-test:probe"
-            docker push "$ACR_FQDN/$REPO/alpine-test:probe"
-          displayName: 'Smoke test: docker push to ACR (alpine)'
-        # ------------------------------------------------------------
-
-        - bash: |
-            set -euo pipefail
-            set -x
-            export BUILDKIT_PROGRESS=plain
-
-            ACR="${ACR_LOGIN_SERVER}"
-            REPO='${{ parameters.imageRepository }}'
-            TAG='$(setvars.IMAGE_TAG)'
-
-            # Validate inputs
-            [[ -n "$REPO" && -n "$TAG" ]] || { echo "Empty REPO or TAG"; exit 20; }
-
-            echo "== Context listing (top-level) =="
-            ls -alh
-            echo "== Dockerfile (head) =="
-            head -n 60 Dockerfile || true
-
-            echo "Preparing buildx..."
-            docker buildx version || true
-            if ! docker buildx inspect builder >/dev/null 2>&1; then
-              docker buildx create --name builder --use
-            else
-              docker buildx use builder
-            fi
-            docker buildx inspect --bootstrap
-
-            echo "== buildx build & push ($ACR/$REPO:$TAG and :latest) =="
-            set +e
-            docker buildx build \
-              --push \
-              --platform linux/amd64 \
-              -t "$ACR/$REPO:$TAG" \
-              -t "$ACR/$REPO:latest" \
-              . 2>&1 | tee buildx.log
-            BX_RC=${PIPESTATUS[0]}
-            set -e
-
-            if [[ $BX_RC -ne 0 ]]; then
-              echo "buildx failed with code $BX_RC — falling back to classic docker build/push"
-              docker build -t "$ACR/$REPO:$TAG" -t "$ACR/$REPO:latest" . 2>&1 | tee build_classic.log
-              docker push "$ACR/$REPO:$TAG"   2>&1 | tee push_tag.log
-              docker push "$ACR/$REPO:latest" 2>&1 | tee push_latest.log
-            fi
-
-            echo "== Local images (top 20) =="
-            docker images | head -n 20 || true
-            set +x
-          displayName: 'Build & push image (diagnostic + fallback)'
-
-        # Always publish logs for troubleshooting
-        - task: PublishBuildArtifacts@1
-          displayName: 'Publish build logs (always)'
-          condition: always()
-          inputs:
-            PathtoPublish: '$(System.DefaultWorkingDirectory)'
-            ArtifactName: 'build-logs'
-            publishLocation: 'Container'
-
-        - task: Bash@3
-          name: publish_meta
-          displayName: 'Publish image metadata'
-          inputs:
-            targetType: inline
-            script: |
-              set -euo pipefail
-              echo "repo=${{ parameters.imageRepository }}"     > image_meta.env
-              echo "tag=$(setvars.IMAGE_TAG)"                  >> image_meta.env
-              echo "registry=$(ACR_LOGIN_SERVER)"              >> image_meta.env
-              echo "----- image_meta.env -----"
-              cat image_meta.env
-
-        - publish: $(System.DefaultWorkingDirectory)/image_meta.env
-          artifact: image_meta
-
-# ----------------------- DEPLOY -----------------------
 - stage: Deploy
-  displayName: Deploy to AKS
-  dependsOn: Build
+  displayName: Deploy to AKS using prebuilt image
   jobs:
     - job: DeployAKS
-      displayName: Apply manifest & set image
+      displayName: Deploy to AKS
       pool:
         vmImage: 'ubuntu-latest'
       steps:
-        - download: current
-          artifact: image_meta
 
         - bash: |
             set -euo pipefail
-            source "$(Pipeline.Workspace)/image_meta/image_meta.env"
-            echo "Deploying $registry/$repo:$tag"
-            echo "##vso[task.setvariable variable=DEPLOY_IMAGE]$registry/$repo:$tag"
-          displayName: 'Read image metadata artifact'
+            IMAGE="$(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}"
+            echo "Using image: $IMAGE"
+            echo "##vso[task.setvariable variable=DEPLOY_IMAGE]$IMAGE"
+          displayName: 'Set DEPLOY_IMAGE variable'
 
-        # Optional: quick auth/object checks
         - task: Kubernetes@1
-          displayName: 'Auth check: can-i patch deployment'
+          displayName: 'Check RBAC: can patch deployment'
           inputs:
             connectionType: 'Kubernetes Service Connection'
             kubernetesServiceEndpoint: '$(SC_AKS)'
@@ -204,18 +60,8 @@ stages:
             command: custom
             arguments: 'auth can-i patch deployment -n $(K8S_NAMESPACE)'
 
-        - task: Kubernetes@1
-          displayName: 'List current deploy/svc'
-          inputs:
-            connectionType: 'Kubernetes Service Connection'
-            kubernetesServiceEndpoint: '$(SC_AKS)'
-            namespace: '$(K8S_NAMESPACE)'
-            command: get
-            arguments: 'deploy,svc -o wide'
-
-        # Apply manifest (keeps spec in Git) and set container image in one go
         - task: KubernetesManifest@1
-          displayName: 'Apply Kubernetes manifest (if enabled)'
+          displayName: 'Apply manifest (if enabled)'
           condition: and(succeeded(), eq(${{ parameters.applyManifest }}, true))
           inputs:
             action: 'deploy'
@@ -227,9 +73,8 @@ stages:
               $(DEPLOY_IMAGE)
             rolloutStatusTimeout: '300'
 
-        # Safety net: ensure the image is set on the deployment (idempotent)
         - task: Kubernetes@1
-          displayName: 'Set image on deployment $(K8S_DEPLOYMENT)'
+          displayName: 'Force set image on deployment (safety net)'
           inputs:
             connectionType: 'Kubernetes Service Connection'
             kubernetesServiceEndpoint: '$(SC_AKS)'
@@ -248,9 +93,8 @@ stages:
             command: rollout
             arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=600s'
 
-        # On failure, dump diagnostics so you can see why
         - task: Kubernetes@1
-          displayName: 'Diagnostics: describe deployment & pods (on failure)'
+          displayName: 'Diagnostics (on failure)'
           condition: failed()
           inputs:
             connectionType: 'Kubernetes Service Connection'
@@ -258,7 +102,8 @@ stages:
             namespace: '$(K8S_NAMESPACE)'
             command: custom
             arguments: >
-              bash -c "kubectl describe deploy/$(K8S_DEPLOYMENT);
-                       kubectl get pods -l app=virec-web-app -o wide;
-                       kubectl describe pod $(kubectl get pods -l app=virec-web-app -o jsonpath='{.items[0].metadata.name}' || true);
-                       kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50"
+              bash -c "
+                kubectl describe deploy/$(K8S_DEPLOYMENT);
+                kubectl get pods -l app=virec-web-app -o wide;
+                kubectl describe pod $(kubectl get pods -l app=virec-web-app -o jsonpath='{.items[0].metadata.name}' || true);
+                kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50

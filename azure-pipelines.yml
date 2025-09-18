@@ -26,7 +26,7 @@ parameters:
   - name: manifestPath
     displayName: Manifest path (used only if applyManifest = true)
     type: string
-    default: manifests/deployment.yaml
+    default: k8s/deployment.yaml
 
 # ---------- Static Variables ----------
 variables:

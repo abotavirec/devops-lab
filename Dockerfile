@@ -28,4 +28,4 @@ COPY --from=build /app/out .
 ENV ASPNETCORE_URLS=http://+:80
 
 # Start the app
-ENTRYPOINT ["dotnet", "WebApp.dll"]
+ENTRYPOINT ["dotnet", "virecintelligencevirecwebapp.dll"]

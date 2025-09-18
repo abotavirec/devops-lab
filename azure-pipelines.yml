@@ -9,77 +9,170 @@ pr:
 # ---------- Runtime Parameters ----------
 parameters:
   - name: imageRepository
-    displayName: Image repository (in ACR)
     type: string
-    default: webapp                  # was: virecintelligencevirecwebapp
-
-  - name: imageTag
-    displayName: Image tag to deploy (e.g., commit SHA or 'latest')
-    type: string
-    default: $(Build.SourceVersion)   # safer than 'latest'
-
-  - name: applyManifest
-    displayName: Also apply a Kubernetes manifest (optional)
-    type: boolean
-    default: true                     # ensure the Deployment exists
-
+    default: 'virecintelligencevirecwebapp'   # align to your ACR repo
   - name: manifestPath
-    displayName: Manifest path (used only if applyManifest = true)
     type: string
-    default: k8s/deployment.yaml
+    default: 'k8s/deployment.yaml'
+  - name: applyManifest
+    type: boolean
+    default: true
 
 # ---------- Static Variables ----------
 variables:
   ACR_LOGIN_SERVER: 'crwebdevcac01.azurecr.io'
-  K8S_NAMESPACE: 'default'            # match your cluster usage
-  K8S_DEPLOYMENT: 'virec-web-app'            # MUST match metadata.name in your Deployment
-  CONTAINER_NAME: 'main'            # MUST match spec.template.spec.containers[0].name
-  SC_AKS: 'sc-aks-web-dev-cac-01'     # your service connection
+  K8S_NAMESPACE: 'default'
+  K8S_DEPLOYMENT: 'virec-web-app'
+  CONTAINER_NAME: 'main'
+  SC_AKS: 'sc-aks-web-dev-cac-01'                  # Kubernetes service connection
+  SC_AZURE: 'sc-azure-rg-sw-web-dev-cac-01'        # ARM service connection for ACR login
 
-# ---------- Deployment Stage ----------
+# ======================= STAGES =======================
 stages:
-  - stage: Deploy_AKS
-    displayName: Deploy pre-built image to AKS
-    jobs:
-      - job: Deploy
-        displayName: Rollout $(K8S_DEPLOYMENT) to ${{ parameters.imageRepository }}:${{ parameters.imageTag }}
-        pool:
-          vmImage: 'ubuntu-latest'
-        steps:
-          - checkout: self
+# -------------------- BUILD & PUSH --------------------
+- stage: Build
+  displayName: Build & Push Image
+  jobs:
+    - job: DockerBuild
+      displayName: Docker buildx + push to ACR
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+          fetchDepth: 0
 
-          # (Optional) apply the Deployment manifest so the resource exists
-          - task: KubernetesManifest@1
-            displayName: 'Apply Kubernetes manifest (if enabled)'
-            condition: and(succeeded(), eq(${{ parameters.applyManifest }}, true))
-            inputs:
-              action: 'deploy'
-              kubernetesServiceConnection: '$(SC_AKS)'
-              namespace: '$(K8S_NAMESPACE)'
-              manifests: |
-                ${{ parameters.manifestPath }}
-              containers: |
-                $(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
-              rolloutStatusTimeout: '300'
+        - bash: |
+            echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(Build.SourceVersion)"
+            echo "Resolved IMAGE_TAG=$(Build.SourceVersion)"
+          name: setvars
+          displayName: "Set IMAGE_TAG to commit SHA"
 
-          # Force rollout by setting image (idempotent if manifest already applied)
-          - task: Kubernetes@1
-            displayName: 'Set image on deployment $(K8S_DEPLOYMENT)'
-            inputs:
-              connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceEndpoint: '$(SC_AKS)'
-              namespace: '$(K8S_NAMESPACE)'
-              command: 'set'
-              arguments: >
-                image deployment/$(K8S_DEPLOYMENT)
-                $(CONTAINER_NAME)=$(ACR_LOGIN_SERVER)/${{ parameters.imageRepository }}:${{ parameters.imageTag }}
+        - task: AzureCLI@2
+          displayName: 'Login to ACR'
+          inputs:
+            azureSubscription: '$(SC_AZURE)'
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              ACR_NAME=${ACR_LOGIN_SERVER%%.*}
+              az acr login --name $ACR_NAME
 
-          # Wait for rollout to complete
-          - task: Kubernetes@1
-            displayName: 'Check rollout status'
-            inputs:
-              connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceEndpoint: '$(SC_AKS)'
-              namespace: '$(K8S_NAMESPACE)'
-              command: 'rollout'
-              arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=600s'
+        - bash: |
+            docker version
+            docker buildx create --use --name builder || true
+            docker buildx use builder
+
+            ACR=$(ACR_LOGIN_SERVER)
+            REPO='${{ parameters.imageRepository }}'
+            TAG='$(setvars.IMAGE_TAG)'
+
+            echo "Building $ACR/$REPO:$TAG and :latest"
+            docker buildx build \
+              --push \
+              --platform linux/amd64 \
+              -t $ACR/$REPO:$TAG \
+              -t $ACR/$REPO:latest \
+              .
+          displayName: 'Buildx: build & push (SHA + latest)'
+
+        - task: Bash@3
+          name: publish_meta
+          displayName: 'Publish image metadata'
+          inputs:
+            targetType: inline
+            script: |
+              echo "repo=${{ parameters.imageRepository }}"     > image_meta.env
+              echo "tag=$(setvars.IMAGE_TAG)"                  >> image_meta.env
+              echo "registry=$(ACR_LOGIN_SERVER)"              >> image_meta.env
+              cat image_meta.env
+
+        - publish: $(System.DefaultWorkingDirectory)/image_meta.env
+          artifact: image_meta
+
+# ----------------------- DEPLOY -----------------------
+- stage: Deploy
+  displayName: Deploy to AKS
+  dependsOn: Build
+  jobs:
+    - job: DeployAKS
+      displayName: Apply manifest & set image
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - download: current
+          artifact: image_meta
+
+        - bash: |
+            source "$(Pipeline.Workspace)/image_meta/image_meta.env"
+            echo "Deploying $registry/$repo:$tag"
+            echo "##vso[task.setvariable variable=DEPLOY_IMAGE]$registry/$repo:$tag"
+          displayName: 'Read image metadata artifact'
+
+        # Optional: quick auth/object checks
+        - task: Kubernetes@1
+          displayName: 'Auth check: can-i patch deployment'
+          inputs:
+            connectionType: 'Kubernetes Service Connection'
+            kubernetesServiceEndpoint: '$(SC_AKS)'
+            namespace: '$(K8S_NAMESPACE)'
+            command: custom
+            arguments: 'auth can-i patch deployment -n $(K8S_NAMESPACE)'
+
+        - task: Kubernetes@1
+          displayName: 'List current deploy/svc'
+          inputs:
+            connectionType: 'Kubernetes Service Connection'
+            kubernetesServiceEndpoint: '$(SC_AKS)'
+            namespace: '$(K8S_NAMESPACE)'
+            command: get
+            arguments: 'deploy,svc -o wide'
+
+        # Apply manifest (keeps spec in Git) and set container image in one go
+        - task: KubernetesManifest@1
+          displayName: 'Apply Kubernetes manifest (if enabled)'
+          condition: and(succeeded(), eq(${{ parameters.applyManifest }}, true))
+          inputs:
+            action: 'deploy'
+            kubernetesServiceConnection: '$(SC_AKS)'
+            namespace: '$(K8S_NAMESPACE)'
+            manifests: |
+              ${{ parameters.manifestPath }}
+            containers: |
+              $(DEPLOY_IMAGE)
+            rolloutStatusTimeout: '300'
+
+        # Safety net: ensure the image is set on the deployment (idempotent)
+        - task: Kubernetes@1
+          displayName: 'Set image on deployment $(K8S_DEPLOYMENT)'
+          inputs:
+            connectionType: 'Kubernetes Service Connection'
+            kubernetesServiceEndpoint: '$(SC_AKS)'
+            namespace: '$(K8S_NAMESPACE)'
+            command: set
+            arguments: >
+              image deployment/$(K8S_DEPLOYMENT)
+              $(CONTAINER_NAME)=$(DEPLOY_IMAGE)
+
+        - task: Kubernetes@1
+          displayName: 'Wait for rollout'
+          inputs:
+            connectionType: 'Kubernetes Service Connection'
+            kubernetesServiceEndpoint: '$(SC_AKS)'
+            namespace: '$(K8S_NAMESPACE)'
+            command: rollout
+            arguments: 'status deployment/$(K8S_DEPLOYMENT) --timeout=600s'
+
+        # On failure, dump diagnostics so you can see why
+        - task: Kubernetes@1
+          displayName: 'Diagnostics: describe deployment & pods (on failure)'
+          condition: failed()
+          inputs:
+            connectionType: 'Kubernetes Service Connection'
+            kubernetesServiceEndpoint: '$(SC_AKS)'
+            namespace: '$(K8S_NAMESPACE)'
+            command: custom
+            arguments: >
+              bash -c "kubectl describe deploy/$(K8S_DEPLOYMENT);
+                       kubectl get pods -l app=virec-web-app -o wide;
+                       kubectl describe pod $(kubectl get pods -l app=virec-web-app -o jsonpath='{.items[0].metadata.name}' || true);
+                       kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50"
